@@ -136,7 +136,10 @@
 </div>
 <div class="row">
   <button id="btnStart" class="go" disabled>Start</button>
-  <button id="btnOff" class="off" disabled>Switch off</button>
+  <button id="btnStop" disabled>Stop</button>
+</div>
+<div class="row">
+  <button id="btnOff" class="off small" disabled>Switch off</button>
 </div>
 <div class="row">
   <button id="btnExport" class="small" disabled>Export</button>
@@ -148,7 +151,7 @@
   <div class="body">
     <div class="grid">
       <div><label for="V_start">Start (V)</label><input id="V_start" type="text" inputmode="decimal" value="-0.4"></div>
-      <div><label for="V_end">End (V)</label><input id="V_end" type="text" inputmode="decimal" value="2"></div>
+      <div><label for="V_end">End (V)</label><input id="V_end" type="text" inputmode="decimal" value="1.6"></div>
       <div><label for="freq">Frequency (Hz)</label><input id="freq" type="text" inputmode="decimal" value="25"></div>
       <div><label for="V_step">Step (mV)</label><input id="V_step" type="text" inputmode="decimal" value="5"></div>
       <div><label for="V_amp">Amplitude (mV)</label><input id="V_amp" type="text" inputmode="decimal" value="25"></div>
@@ -202,7 +205,7 @@
 <script>
 "use strict";
 /* ============================================================================
-   Skin-Biosense v4.0.0
+   Skin-Biosense v5.0.0
    Port of the techBASIC "SUWED" program (Fluika OÜ) to Web Bluetooth.
    Runs in any browser exposing navigator.bluetooth — Bluefy / WebBLE on iPadOS,
    Chrome / Edge on Android. Deviations from the .bas are marked [DIFF].
@@ -245,6 +248,7 @@ let regs = [], regsi = 0;
 let pts = [], lastIndex = -1;
 let watchdog = null, retries = 0;
 let measuredSample = '';
+let framesLost = 0, stopped = false;
 
 /* --- Helpers -------------------------------------------------------------- */
 const $ = id => document.getElementById(id);
@@ -272,7 +276,7 @@ function today() { return new Date().toLocaleDateString('sv-SE'); }  // YYYY-MM-
 function readConfig() {
   cfg = {
     V_start: num('V_start', -0.4),
-    V_end:   num('V_end', 2),
+    V_end:   num('V_end', 1.6),
     freq:    num('freq', 25),
     V_step:  num('V_step', 5),
     V_amp:   num('V_amp', 25),
@@ -341,6 +345,7 @@ function onDisconnected() {
 }
 function enable(on) {
   ['btnInit', 'btnStart', 'btnOff'].forEach(id => $(id).disabled = !on);
+  if (!on) $('btnStop').disabled = true;
   $('btnConnect').textContent = on ? 'Disconnect' : 'Connect';
 }
 
@@ -419,8 +424,11 @@ function csProc(a) {
 function csDone() {
   clearWatchdog();
   if (comMODE === 1) {
-    setStatus('Measurement complete — ' + pairCount() + ' points', 'on');
-    log('Measurement sequence complete', 'ok');
+    $('btnStop').disabled = true;
+    const lost = framesLost ? ' — ' + framesLost + ' frames lost' : '';
+    setStatus('Measurement complete — ' + pairCount() + ' points' + lost, lost ? 'busy' : 'on');
+    log('Measurement complete: ' + pairCount() + ' points, ' + framesLost + ' lost',
+        framesLost ? 'err' : 'ok');
     openSave();
   } else {
     applyRegisters();
@@ -437,6 +445,8 @@ function parseRegister(a) {
   regsi++;
   if (regsi <= 20) regs[regsi - 1] = s;
 }
+let calLoaded = false;
+
 function applyRegisters() {
   const v = i => parseFloat(regs[i]) || 0;
   cal.DAC_a = v(4) / (-1e11);
@@ -445,15 +455,31 @@ function applyRegisters() {
   cal.ADC_a[1] = v(8)  / 1e9;  cal.ADC_b[1] = v(9)  / 1e4;
   cal.ADC_a[2] = v(10) / 1e10; cal.ADC_b[2] = v(11) / 1e5;
   cal.ADC_a[3] = v(12) / 1e11; cal.ADC_b[3] = v(13) / 1e6;
-  /* [DIFF] As in the .bas, DAC_a/DAC_b are read but NOT applied to pot_a/pot_b. */
+
+  /* [FIX v4.0.1] The .bas reads DAC_a/DAC_b and then never uses them, leaving
+     the potential axis on hard-coded constants. On the test device that shifted
+     the whole axis by +0.227 V. The per-device values are applied here. */
+  if (Number.isFinite(cal.DAC_a) && Number.isFinite(cal.DAC_b) &&
+      cal.DAC_a < 0 && cal.DAC_b > 0.5 && cal.DAC_b < 5) {
+    log('DAC cal: a=' + cal.DAC_a.toExponential(6) + '  b=' + cal.DAC_b.toFixed(6) +
+        '  (was a=' + cal.pot_a.toExponential(6) + '  b=' + cal.pot_b.toFixed(6) + ')', 'ok');
+    cal.pot_a = cal.DAC_a;
+    cal.pot_b = cal.DAC_b;
+    calLoaded = true;
+    computeDerived();
+  } else {
+    log('DAC cal out of range (a=' + cal.DAC_a + ' b=' + cal.DAC_b + ') — keeping defaults', 'err');
+  }
 }
 
 /* --- Sequences ------------------------------------------------------------ */
 function initializeUWED() {
   readConfig();
-  pts = []; lastIndex = -1;
+  if (!calLoaded) log('Warning: Initialize not run — using default calibration', 'err');
+  pts = []; lastIndex = -1; framesLost = 0; stopped = false;
   measuredSample = sanitize($('sampleName').value);
   comMODE = 1;
+  $('btnStop').disabled = false;
   csReset();
   csAdd('A', der.D_start);
   csAdd('X', 0);
@@ -503,6 +529,16 @@ function pushPoint(a, gi, tsA, tsB, vA, vB, aA, aB) {
 }
 function procData(a) {
   if (a[0] === lastIndex) return;
+  /* Frames carry a rolling one-byte index. A jump means the radio dropped
+     cycles — the curve then looks shifted even though the sweep was correct. */
+  if (lastIndex >= 0) {
+    const expected = (lastIndex + 1) & 0xff;
+    if (a[0] !== expected) {
+      const missed = (a[0] - expected + 256) & 0xff;
+      framesLost += missed;
+      log('Frame gap: ' + missed + ' lost (index ' + expected + ' -> ' + a[0] + ')', 'err');
+    }
+  }
   lastIndex = a[0];
   if (a[1] !== 0x4d || a.length < 16) return;
   if (pts.length + 2 > NR_DATA_POINTS) return;
@@ -519,6 +555,13 @@ function swvPairs() {
   for (let k = 0; k < pairCount(); k++) {
     const p1 = pts[2 * k], p2 = pts[2 * k + 1];
     out.push([(p2.Vr + p1.Vr) / 2, p2.IuA - p1.IuA]);
+  }
+  /* [FIX v4.0.1] The device emits one settling pair before the ramp; it sits
+     off the regular grid. Drop it when its gap exceeds twice the nominal step. */
+  if (out.length > 3) {
+    const gap0 = Math.abs(out[1][0] - out[0][0]);
+    const gap1 = Math.abs(out[2][0] - out[1][0]);
+    if (gap1 > 0 && gap0 > 2 * gap1) out.shift();
   }
   return out;
 }
@@ -603,9 +646,12 @@ function draw() {
   ctx.restore();
 
   if (data.length > 1) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(m.l, m.t, w - m.l - m.r, h - m.t - m.b); ctx.clip();
     ctx.strokeStyle = '#7be38c'; ctx.lineWidth = 2; ctx.beginPath();
     data.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])));
     ctx.stroke();
+    ctx.restore();
   }
   const nm = $('sampleName').value.trim();
   $('plotmeta').textContent = nm || (data.length ? '' : 'Square wave voltammetry');
@@ -754,6 +800,22 @@ async function doSave() {
   else setStatus('Saved locally — ' + name, 'on');
 }
 
+/* --- Stop ----------------------------------------------------------------- */
+/* Halts acquisition on this side and keeps whatever was collected. The Fluika
+   command set has no documented abort, so the sensor may finish its sweep on
+   its own; use Switch off to cut it short. [TO CONFIRM with Fluika] */
+function stopMeasurement() {
+  if (comMODE !== 1 || stopped) return;
+  stopped = true;
+  cs.run = 0;
+  clearWatchdog();
+  $('btnStop').disabled = true;
+  log('Stopped by user at ' + pairCount() + ' points — sensor may still be sweeping', 'err');
+  setStatus('Stopped — ' + pairCount() + ' points', 'on');
+  refreshButtons();
+  if (pairCount() > 0) openSave();
+}
+
 /* --- UI wiring ------------------------------------------------------------ */
 function refreshButtons() {
   const has = pairCount() > 0;
@@ -766,6 +828,7 @@ $('btnConnect').onclick = async () => {
 };
 $('btnInit').onclick   = () => { log('— Initialize: reading registers —'); readRegisters(); };
 $('btnStart').onclick  = () => { log('— Starting measurement —'); initializeUWED(); refreshButtons(); };
+$('btnStop').onclick   = stopMeasurement;
 $('btnOff').onclick    = () => { setStatus('Switching off', 'busy'); sendToUWED('Q()'); };
 $('btnClear').onclick  = () => { pts = []; lastIndex = -1; draw(); refreshButtons(); };
 $('btnExport').onclick = openSave;
